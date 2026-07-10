@@ -113,7 +113,7 @@ class CameraController(
     fun maxZoomRatio(): Float = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
     fun currentZoomRatio(): Float = camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
 
-    fun exposureRange(): ClosedRange<Int> {
+    fun exposureRange(): IntRange {
         val state = camera?.cameraInfo?.exposureState ?: return 0..0
         return state.exposureCompensationRange.lower..state.exposureCompensationRange.upper
     }
