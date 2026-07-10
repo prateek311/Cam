@@ -33,16 +33,20 @@ class CameraController(
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private var flashSetting = FlashSetting.OFF
 
+    // Invoked every time the camera (re)binds — initial bind and every lens switch —
+    // so callers can refresh anything derived from CameraInfo (zoom/exposure ranges).
+    private var onCameraBound: (() -> Unit)? = null
+
     fun bind(
         providerFuture: ListenableFuture<ProcessCameraProvider>,
         executor: Executor,
         previewView: PreviewView,
-        onReady: () -> Unit,
+        onCameraBound: () -> Unit,
     ) {
+        this.onCameraBound = onCameraBound
         providerFuture.addListener({
             cameraProvider = providerFuture.get()
             rebind(previewView)
-            onReady()
         }, executor)
     }
 
@@ -65,6 +69,7 @@ class CameraController(
         imageCapture = newImageCapture
 
         applyFlashSetting(flashSetting)
+        onCameraBound?.invoke()
     }
 
     fun toggleLensFacing(previewView: PreviewView) {

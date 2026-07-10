@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -35,24 +36,28 @@ import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -65,13 +70,21 @@ import com.drfin.timercam.camera.ShutterMode
 import com.drfin.timercam.ui.theme.AccentAmber
 import com.drfin.timercam.ui.theme.SurfaceScrim
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
+
+private val ZOOM_PRESETS = listOf(0.5f, 1f, 2f, 3f)
+private const val FOCUS_RING_MS = 900L
+private const val EXPOSURE_SLIDER_IDLE_MS = 3000L
 
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
     val previewView = remember { PreviewView(context) }
@@ -84,9 +97,21 @@ fun CameraScreen() {
     var lastThumbnail by remember { mutableStateOf<Bitmap?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
+    // Mirrors of CameraController's CameraInfo-derived ranges, refreshed via
+    // onCameraBound below (fires on initial bind AND every lens switch).
+    var exposureRange by remember { mutableStateOf(0..0) }
+    var minZoom by remember { mutableFloatStateOf(1f) }
+    var maxZoom by remember { mutableFloatStateOf(1f) }
+
     var mode by remember { mutableStateOf(ShutterMode.SINGLE) }
     var timerSeconds by remember { mutableStateOf(TIMER_OPTIONS.first()) }
     var shotCount by remember { mutableStateOf(SHOT_COUNT_OPTIONS.first()) }
+
+    var focusPoint by remember { mutableStateOf<Offset?>(null) }
+    var focusRingVisible by remember { mutableStateOf(false) }
+    var exposureSliderVisible by remember { mutableStateOf(false) }
+    var focusNonce by remember { mutableIntStateOf(0) }
+    var exposureNonce by remember { mutableIntStateOf(0) }
 
     val session = remember {
         BurstCaptureSession(
@@ -102,6 +127,7 @@ fun CameraScreen() {
         )
     }
     val captureState by session.state.collectAsState()
+    val isIdle = captureState == CaptureUiState.Idle
 
     LaunchedEffect(Unit) {
         val providerFuture = ProcessCameraProvider.getInstance(context)
@@ -109,10 +135,30 @@ fun CameraScreen() {
             providerFuture = providerFuture,
             executor = ContextCompat.getMainExecutor(context),
             previewView = previewView,
-            onReady = {
-                exposureIndex = 0
+            onCameraBound = {
+                val newRange = cameraController.exposureRange()
+                exposureRange = newRange
+                exposureIndex = exposureIndex.coerceIn(newRange.start, newRange.endInclusive.coerceAtLeast(newRange.start))
+                minZoom = cameraController.minZoomRatio()
+                maxZoom = cameraController.maxZoomRatio()
+                zoomRatio = cameraController.currentZoomRatio()
             },
         )
+    }
+
+    LaunchedEffect(focusNonce) {
+        if (focusNonce > 0) {
+            focusRingVisible = true
+            delay(FOCUS_RING_MS)
+            focusRingVisible = false
+        }
+    }
+    LaunchedEffect(exposureNonce) {
+        if (exposureNonce > 0) {
+            exposureSliderVisible = true
+            delay(EXPOSURE_SLIDER_IDLE_MS)
+            exposureSliderVisible = false
+        }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -132,6 +178,9 @@ fun CameraScreen() {
                 .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         cameraController.focusOnPoint(previewView, offset.x, offset.y)
+                        focusPoint = offset
+                        focusNonce++
+                        exposureNonce++
                     }
                 },
         )
@@ -157,7 +206,6 @@ fun CameraScreen() {
             }
             IconButton(onClick = {
                 cameraController.toggleLensFacing(previewView)
-                zoomRatio = 1f
             }) {
                 Icon(
                     imageVector = Icons.Filled.Cameraswitch,
@@ -167,54 +215,30 @@ fun CameraScreen() {
             }
         }
 
-        // Exposure ("lighting") slider, docked below the top controls row.
-        val range = cameraController.exposureRange()
-        if (range.endInclusive > range.start) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 88.dp, end = 12.dp)
-                    .background(SurfaceScrim, RoundedCornerShape(12.dp))
-                    .padding(horizontal = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text("Light", color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp)
-                Slider(
-                    value = exposureIndex.toFloat(),
-                    onValueChange = {
-                        exposureIndex = it.toInt()
-                        cameraController.setExposureCompensation(exposureIndex)
-                    },
-                    valueRange = range.start.toFloat()..range.endInclusive.toFloat(),
-                    steps = (range.endInclusive - range.start - 1).coerceAtLeast(0),
-                    modifier = Modifier.size(width = 140.dp, height = 32.dp),
-                )
-            }
-        }
+        // Tap-to-focus ring + drag-to-adjust exposure slider, anchored at the tap point.
+        focusPoint?.let { point ->
+            FocusRing(
+                visible = focusRingVisible,
+                modifier = Modifier.offset {
+                    val half = with(density) { 36.dp.roundToPx() }
+                    IntOffset(point.x.roundToInt() - half, point.y.roundToInt() - half)
+                },
+            )
 
-        // Bottom countdown strip - overlays the LOWER part only, preview stays visible above it.
-        val state = captureState
-        if (state is CaptureUiState.CountingDown) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(bottom = 220.dp)
-                    .background(SurfaceScrim, RoundedCornerShape(20.dp))
-                    .padding(vertical = 12.dp),
-            ) {
-                Text(
-                    text = "${state.secondsRemaining}",
-                    color = AccentAmber,
-                    fontSize = 56.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    text = "  shot ${state.shotIndex}/${state.totalShots}",
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontSize = 16.sp,
+            if (exposureRange.endInclusive > exposureRange.start) {
+                ExposureSlider(
+                    exposureIndex = exposureIndex,
+                    range = exposureRange,
+                    onChange = { newIndex ->
+                        exposureIndex = newIndex
+                        cameraController.setExposureCompensation(newIndex)
+                    },
+                    onInteraction = { exposureNonce++ },
+                    modifier = Modifier.offset {
+                        val offsetX = with(density) { 48.dp.roundToPx() }
+                        val offsetY = with(density) { 80.dp.roundToPx() }
+                        IntOffset(point.x.roundToInt() + offsetX, point.y.roundToInt() - offsetY)
+                    },
                 )
             }
         }
@@ -235,7 +259,8 @@ fun CameraScreen() {
             )
         }
 
-        // Bottom controls: mode/timer/shot-count chips + shutter button.
+        // Bottom controls: while idle, zoom presets + mode/timer/shot-count chips + shutter.
+        // While capturing, everything collapses to a single capsule (countdown + cancel).
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -243,17 +268,26 @@ fun CameraScreen() {
                 .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            TimerBurstControls(
-                mode = mode,
-                onModeChange = { mode = it },
-                timerSeconds = timerSeconds,
-                onTimerChange = { timerSeconds = it },
-                shotCount = shotCount,
-                onShotCountChange = { shotCount = it },
-                modifier = Modifier.padding(bottom = 16.dp, start = 16.dp, end = 16.dp),
-            )
-
-            if (state == CaptureUiState.Idle) {
+            if (isIdle) {
+                ZoomPresetRow(
+                    currentRatio = zoomRatio,
+                    minRatio = minZoom,
+                    maxRatio = maxZoom,
+                    onSelect = { ratio ->
+                        zoomRatio = ratio
+                        cameraController.setZoomRatio(ratio)
+                    },
+                    modifier = Modifier.padding(bottom = 12.dp),
+                )
+                TimerBurstControls(
+                    mode = mode,
+                    onModeChange = { mode = it },
+                    timerSeconds = timerSeconds,
+                    onTimerChange = { timerSeconds = it },
+                    shotCount = shotCount,
+                    onShotCountChange = { shotCount = it },
+                    modifier = Modifier.padding(bottom = 16.dp, start = 16.dp, end = 16.dp),
+                )
                 IconButton(
                     onClick = { session.start(mode, timerSeconds, shotCount) },
                     modifier = Modifier
@@ -267,18 +301,7 @@ fun CameraScreen() {
                     )
                 }
             } else {
-                IconButton(
-                    onClick = { session.cancel() },
-                    modifier = Modifier
-                        .size(76.dp)
-                        .background(SurfaceScrim, CircleShape),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Close,
-                        contentDescription = "Cancel",
-                        tint = MaterialTheme.colorScheme.onSurface,
-                    )
-                }
+                CaptureStatusCapsule(state = captureState, onCancel = { session.cancel() })
             }
         }
 
@@ -295,6 +318,85 @@ fun CameraScreen() {
         }
     }
 }
+
+/** Quick zoom-ratio presets (0.5x/1x/2x/3x), filtered to what this lens actually supports. */
+@Composable
+private fun ZoomPresetRow(
+    currentRatio: Float,
+    minRatio: Float,
+    maxRatio: Float,
+    onSelect: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val candidates = ZOOM_PRESETS.filter { it in minRatio..maxRatio }
+    if (candidates.size < 2) return
+
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = modifier) {
+        candidates.forEach { ratio ->
+            val selected = abs(currentRatio - ratio) < 0.05f
+            Box(
+                modifier = Modifier
+                    .size(if (selected) 44.dp else 36.dp)
+                    .background(if (selected) AccentAmber else SurfaceScrim, CircleShape)
+                    .clickable { onSelect(ratio) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = formatZoomLabel(ratio),
+                    color = if (selected) Color.Black else MaterialTheme.colorScheme.onSurface,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+/** Single bottom pill shown while counting down / capturing: status text + cancel, together. */
+@Composable
+private fun CaptureStatusCapsule(state: CaptureUiState, onCancel: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        modifier = Modifier
+            .background(SurfaceScrim, RoundedCornerShape(28.dp))
+            .padding(start = 20.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+    ) {
+        when (state) {
+            is CaptureUiState.CountingDown -> {
+                Text(
+                    text = "${state.secondsRemaining}",
+                    color = AccentAmber,
+                    fontSize = 40.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "shot ${state.shotIndex}/${state.totalShots}",
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 14.sp,
+                )
+            }
+            is CaptureUiState.Capturing -> {
+                Text(
+                    text = "Capturing ${state.shotIndex}/${state.totalShots}",
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 16.sp,
+                )
+            }
+            CaptureUiState.Idle -> Unit
+        }
+        IconButton(onClick = onCancel, modifier = Modifier.size(48.dp)) {
+            Icon(
+                imageVector = Icons.Filled.Close,
+                contentDescription = "Cancel",
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+private fun formatZoomLabel(ratio: Float): String =
+    if (ratio == ratio.toInt().toFloat()) "${ratio.toInt()}x" else "${ratio}x"
 
 private fun openPhoto(context: Context, uri: Uri) {
     val intent = Intent(Intent.ACTION_VIEW).apply {
