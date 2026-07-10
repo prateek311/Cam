@@ -51,7 +51,7 @@ class CameraController(
         provider.unbindAll()
 
         val newPreview = Preview.Builder().build().also {
-            it.surfaceProvider = previewView.surfaceProvider
+            it.setSurfaceProvider(previewView.surfaceProvider)
         }
         val newImageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
