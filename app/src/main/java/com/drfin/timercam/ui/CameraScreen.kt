@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlashlightOn
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -64,9 +65,14 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.drfin.timercam.camera.BurstCaptureSession
 import com.drfin.timercam.camera.CameraController
+import com.drfin.timercam.camera.CaptureSettingsStore
 import com.drfin.timercam.camera.CaptureUiState
 import com.drfin.timercam.camera.FlashSetting
+import com.drfin.timercam.camera.PhotoQuality
+import com.drfin.timercam.camera.RecordingUiState
 import com.drfin.timercam.camera.ShutterMode
+import com.drfin.timercam.camera.VideoQuality
+import com.drfin.timercam.camera.VideoRecordingSession
 import com.drfin.timercam.ui.theme.AccentAmber
 import com.drfin.timercam.ui.theme.SurfaceScrim
 import kotlinx.coroutines.Dispatchers
@@ -80,6 +86,9 @@ private val ZOOM_PRESETS = listOf(0.5f, 1f, 2f, 3f)
 private const val FOCUS_RING_MS = 900L
 private const val EXPOSURE_SLIDER_IDLE_MS = 3000L
 
+/** Photo vs. video capture mode, toggled above the shutter button. */
+private enum class CaptureMode { PHOTO, VIDEO }
+
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
@@ -87,15 +96,24 @@ fun CameraScreen() {
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
+    val settingsStore = remember { CaptureSettingsStore(context) }
+    var videoQuality by remember { mutableStateOf(settingsStore.getVideoQuality()) }
+    var photoQuality by remember { mutableStateOf(settingsStore.getPhotoQuality()) }
+
     val previewView = remember { PreviewView(context) }
-    val cameraController = remember { CameraController(context, lifecycleOwner) }
+    val cameraController = remember {
+        CameraController(context, lifecycleOwner).apply { setInitialQualities(videoQuality, photoQuality) }
+    }
 
     var flashSetting by remember { mutableStateOf(FlashSetting.OFF) }
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var exposureIndex by remember { mutableStateOf(0) }
-    var lastPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var lastMediaUri by remember { mutableStateOf<Uri?>(null) }
+    var lastMediaIsVideo by remember { mutableStateOf(false) }
     var lastThumbnail by remember { mutableStateOf<Bitmap?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var captureMode by remember { mutableStateOf(CaptureMode.PHOTO) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
 
     // Mirrors of CameraController's CameraInfo-derived ranges, refreshed via
     // onCameraBound below (fires on initial bind AND every lens switch).
@@ -118,7 +136,8 @@ fun CameraScreen() {
             scope = scope,
             takePhoto = { cameraController.takePhoto() },
             onPhotoSaved = { uri ->
-                lastPhotoUri = uri
+                lastMediaUri = uri
+                lastMediaIsVideo = false
                 scope.launch {
                     lastThumbnail = withContext(Dispatchers.IO) { loadThumbnail(context, uri) }
                 }
@@ -127,7 +146,22 @@ fun CameraScreen() {
         )
     }
     val captureState by session.state.collectAsState()
-    val isIdle = captureState == CaptureUiState.Idle
+
+    val videoSession = remember {
+        VideoRecordingSession(
+            cameraController = cameraController,
+            onVideoSaved = { uri ->
+                lastMediaUri = uri
+                lastMediaIsVideo = true
+                scope.launch {
+                    lastThumbnail = withContext(Dispatchers.IO) { loadThumbnail(context, uri) }
+                }
+            },
+            onError = { errorMessage = it.message ?: "Failed to record video" },
+        )
+    }
+    val videoState by videoSession.state.collectAsState()
+    val isRecordingVideo = videoState is RecordingUiState.Recording
 
     LaunchedEffect(Unit) {
         val providerFuture = ProcessCameraProvider.getInstance(context)
@@ -204,14 +238,26 @@ fun CameraScreen() {
                     tint = MaterialTheme.colorScheme.onSurface,
                 )
             }
-            IconButton(onClick = {
-                cameraController.toggleLensFacing(previewView)
-            }) {
-                Icon(
-                    imageVector = Icons.Filled.Cameraswitch,
-                    contentDescription = "Switch camera",
-                    tint = MaterialTheme.colorScheme.onSurface,
-                )
+            Row {
+                // Both rebind the camera (to apply the new quality / lens), which would
+                // orphan an in-progress recording — disabled while one is active.
+                IconButton(onClick = { showSettingsSheet = true }, enabled = !isRecordingVideo) {
+                    Icon(
+                        imageVector = Icons.Filled.Settings,
+                        contentDescription = "Capture quality settings",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                IconButton(
+                    onClick = { cameraController.toggleLensFacing(previewView) },
+                    enabled = !isRecordingVideo,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Cameraswitch,
+                        contentDescription = "Switch camera",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
         }
 
@@ -243,24 +289,48 @@ fun CameraScreen() {
             }
         }
 
-        // Bottom-left thumbnail of the last captured photo.
+        // Bottom-left thumbnail of the last captured photo or video.
         lastThumbnail?.let { bitmap ->
             Image(
                 bitmap = bitmap.asImageBitmap(),
-                contentDescription = "View last photo",
+                contentDescription = if (lastMediaIsVideo) "View last video" else "View last photo",
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(start = 16.dp, bottom = 16.dp)
                     .size(56.dp)
                     .border(2.dp, MaterialTheme.colorScheme.onSurface, RoundedCornerShape(8.dp))
                     .clickable {
-                        lastPhotoUri?.let { uri -> openPhoto(context, uri) }
+                        lastMediaUri?.let { uri -> openMedia(context, uri, lastMediaIsVideo) }
                     },
             )
         }
 
-        // Bottom controls: while idle, zoom presets + mode/timer/shot-count chips + shutter.
-        // While capturing, everything collapses to a single capsule (countdown + cancel).
+        // Recording indicator, shown centered at the top while a video is being recorded.
+        if (isRecordingVideo) {
+            val elapsedMs = (videoState as RecordingUiState.Recording).elapsedMs
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 32.dp)
+                    .background(SurfaceScrim, RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Box(modifier = Modifier.size(10.dp).background(Color.Red, CircleShape))
+                Text(
+                    text = formatElapsed(elapsedMs),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+
+        // Bottom controls: while idle, zoom presets + mode toggle + timer/burst chips (photo
+        // only) + shutter. While photo-capturing, everything collapses to a single capsule
+        // (countdown + cancel). While video-recording, only the shutter (now a stop button)
+        // stays visible; the recording indicator above communicates elapsed time.
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -268,40 +338,43 @@ fun CameraScreen() {
                 .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (isIdle) {
-                ZoomPresetRow(
-                    currentRatio = zoomRatio,
-                    minRatio = minZoom,
-                    maxRatio = maxZoom,
-                    onSelect = { ratio ->
-                        zoomRatio = ratio
-                        cameraController.setZoomRatio(ratio)
-                    },
-                    modifier = Modifier.padding(bottom = 12.dp),
-                )
-                TimerBurstControls(
-                    mode = mode,
-                    onModeChange = { mode = it },
-                    timerSeconds = timerSeconds,
-                    onTimerChange = { timerSeconds = it },
-                    shotCount = shotCount,
-                    onShotCountChange = { shotCount = it },
-                    modifier = Modifier.padding(bottom = 16.dp, start = 16.dp, end = 16.dp),
-                )
-                IconButton(
-                    onClick = { session.start(mode, timerSeconds, shotCount) },
-                    modifier = Modifier
-                        .size(76.dp)
-                        .border(4.dp, MaterialTheme.colorScheme.onSurface, CircleShape),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(60.dp)
-                            .background(AccentAmber, CircleShape),
-                    )
-                }
-            } else {
+            if (captureState != CaptureUiState.Idle) {
                 CaptureStatusCapsule(state = captureState, onCancel = { session.cancel() })
+            } else {
+                if (!isRecordingVideo) {
+                    ZoomPresetRow(
+                        currentRatio = zoomRatio,
+                        minRatio = minZoom,
+                        maxRatio = maxZoom,
+                        onSelect = { ratio ->
+                            zoomRatio = ratio
+                            cameraController.setZoomRatio(ratio)
+                        },
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                    CaptureModeRow(
+                        mode = captureMode,
+                        onModeChange = { captureMode = it },
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                    if (captureMode == CaptureMode.PHOTO) {
+                        TimerBurstControls(
+                            mode = mode,
+                            onModeChange = { mode = it },
+                            timerSeconds = timerSeconds,
+                            onTimerChange = { timerSeconds = it },
+                            shotCount = shotCount,
+                            onShotCountChange = { shotCount = it },
+                            modifier = Modifier.padding(bottom = 16.dp, start = 16.dp, end = 16.dp),
+                        )
+                    }
+                }
+                ShutterButton(
+                    mode = captureMode,
+                    isRecording = isRecordingVideo,
+                    onPhotoShutter = { session.start(mode, timerSeconds, shotCount) },
+                    onVideoToggle = { if (isRecordingVideo) videoSession.stop() else videoSession.start() },
+                )
             }
         }
 
@@ -315,6 +388,78 @@ fun CameraScreen() {
                     .background(SurfaceScrim, RoundedCornerShape(8.dp))
                     .padding(8.dp),
             )
+        }
+
+        if (showSettingsSheet) {
+            CaptureSettingsSheet(
+                videoQuality = videoQuality,
+                onVideoQualityChange = { quality ->
+                    videoQuality = quality
+                    settingsStore.setVideoQuality(quality)
+                    cameraController.updateVideoQuality(quality)
+                },
+                photoQuality = photoQuality,
+                onPhotoQualityChange = { quality ->
+                    photoQuality = quality
+                    settingsStore.setPhotoQuality(quality)
+                    cameraController.updatePhotoQuality(quality)
+                },
+                onDismiss = { showSettingsSheet = false },
+            )
+        }
+    }
+}
+
+/** Photo/Video mode toggle, styled like the Single/Timer+Burst chips below it. */
+@Composable
+private fun CaptureModeRow(
+    mode: CaptureMode,
+    onModeChange: (CaptureMode) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = modifier
+            .background(SurfaceScrim, RoundedCornerShape(16.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        listOf(CaptureMode.PHOTO to "Photo", CaptureMode.VIDEO to "Video").forEach { (candidate, label) ->
+            val selected = candidate == mode
+            Box(
+                modifier = Modifier
+                    .background(if (selected) AccentAmber else Color.Transparent, RoundedCornerShape(10.dp))
+                    .clickable { onModeChange(candidate) }
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    text = label,
+                    color = if (selected) Color.Black else MaterialTheme.colorScheme.onSurface,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+/** The shutter button itself: amber circle for photo, red circle/square for video record/stop. */
+@Composable
+private fun ShutterButton(
+    mode: CaptureMode,
+    isRecording: Boolean,
+    onPhotoShutter: () -> Unit,
+    onVideoToggle: () -> Unit,
+) {
+    IconButton(
+        onClick = if (mode == CaptureMode.PHOTO) onPhotoShutter else onVideoToggle,
+        modifier = Modifier
+            .size(76.dp)
+            .border(4.dp, MaterialTheme.colorScheme.onSurface, CircleShape),
+    ) {
+        when {
+            mode == CaptureMode.PHOTO -> Box(modifier = Modifier.size(60.dp).background(AccentAmber, CircleShape))
+            isRecording -> Box(modifier = Modifier.size(28.dp).background(Color.Red, RoundedCornerShape(6.dp)))
+            else -> Box(modifier = Modifier.size(60.dp).background(Color.Red, CircleShape))
         }
     }
 }
@@ -398,12 +543,19 @@ private fun CaptureStatusCapsule(state: CaptureUiState, onCancel: () -> Unit) {
 private fun formatZoomLabel(ratio: Float): String =
     if (ratio == ratio.toInt().toFloat()) "${ratio.toInt()}x" else "${ratio}x"
 
-private fun openPhoto(context: Context, uri: Uri) {
+private fun openMedia(context: Context, uri: Uri, isVideo: Boolean) {
     val intent = Intent(Intent.ACTION_VIEW).apply {
-        setDataAndType(uri, "image/*")
+        setDataAndType(uri, if (isVideo) "video/*" else "image/*")
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     context.startActivity(intent)
+}
+
+private fun formatElapsed(elapsedMs: Long): String {
+    val totalSeconds = elapsedMs / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
 }
 
 private suspend fun loadThumbnail(context: Context, uri: Uri): Bitmap? = try {

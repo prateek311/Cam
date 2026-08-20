@@ -8,7 +8,14 @@ import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.concurrent.Executor
@@ -18,7 +25,7 @@ enum class FlashSetting { AUTO, ON, OFF, TORCH }
 
 /**
  * Thin wrapper around CameraX bind/rebind + the controls this app exposes
- * (flash, zoom, exposure, focus, lens facing). Holds no UI state itself.
+ * (flash, zoom, exposure, focus, lens facing, video/photo quality). Holds no UI state itself.
  */
 class CameraController(
     private val context: Context,
@@ -29,13 +36,25 @@ class CameraController(
     private var preview: Preview? = null
     var imageCapture: ImageCapture? = null
         private set
+    var videoCapture: VideoCapture<Recorder>? = null
+        private set
 
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private var flashSetting = FlashSetting.OFF
+    private var videoQuality = VideoQuality.RECOMMENDED
+    private var photoQuality = PhotoQuality.STANDARD
+    private var activeRecording: Recording? = null
 
     // Invoked every time the camera (re)binds — initial bind and every lens switch —
     // so callers can refresh anything derived from CameraInfo (zoom/exposure ranges).
     private var onCameraBound: (() -> Unit)? = null
+    private var boundPreviewView: PreviewView? = null
+
+    /** Must be called before [bind] to take effect on the initial bind. */
+    fun setInitialQualities(video: VideoQuality, photo: PhotoQuality) {
+        videoQuality = video
+        photoQuality = photo
+    }
 
     fun bind(
         providerFuture: ListenableFuture<ProcessCameraProvider>,
@@ -52,6 +71,7 @@ class CameraController(
 
     private fun rebind(previewView: PreviewView) {
         val provider = cameraProvider ?: return
+        boundPreviewView = previewView
         provider.unbindAll()
 
         val newPreview = Preview.Builder().build().also {
@@ -60,16 +80,41 @@ class CameraController(
         val newImageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setFlashMode(toImageCaptureFlashMode(flashSetting))
+            .setJpegQuality(photoQuality.jpegQuality)
             .build()
+
+        val recorder = Recorder.Builder()
+            .setQualitySelector(
+                QualitySelector.from(
+                    videoQuality.quality,
+                    FallbackStrategy.higherQualityOrLowerThan(videoQuality.quality),
+                ),
+            )
+            .setTargetVideoEncodingBitRate(videoQuality.bitRate)
+            .build()
+        val newVideoCapture = VideoCapture.withOutput(recorder)
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
-        camera = provider.bindToLifecycle(lifecycleOwner, selector, newPreview, newImageCapture)
+        camera = provider.bindToLifecycle(lifecycleOwner, selector, newPreview, newImageCapture, newVideoCapture)
         preview = newPreview
         imageCapture = newImageCapture
+        videoCapture = newVideoCapture
 
         applyFlashSetting(flashSetting)
         onCameraBound?.invoke()
+    }
+
+    /** Changes the video quality/bitrate tier and rebinds so it takes effect immediately. */
+    fun updateVideoQuality(quality: VideoQuality) {
+        videoQuality = quality
+        boundPreviewView?.let { rebind(it) }
+    }
+
+    /** Changes the JPEG compression tier and rebinds so it takes effect immediately. */
+    fun updatePhotoQuality(quality: PhotoQuality) {
+        photoQuality = quality
+        boundPreviewView?.let { rebind(it) }
     }
 
     fun toggleLensFacing(previewView: PreviewView) {
@@ -134,5 +179,22 @@ class CameraController(
     suspend fun takePhoto(): Uri {
         val capture = imageCapture ?: error("Camera not ready")
         return MediaStoreSaver.capture(capture, context)
+    }
+
+    // Mic permission is enforced upfront in MainActivity before CameraScreen (and this
+    // controller) is ever reached, so withAudioEnabled() here always has it granted.
+    @android.annotation.SuppressLint("MissingPermission")
+    fun startVideoRecording(onEvent: (VideoRecordEvent) -> Unit) {
+        val capture = videoCapture ?: error("Camera not ready")
+        val outputOptions = MediaStoreSaver.videoOutputOptions(context)
+        activeRecording = capture.output
+            .prepareRecording(context, outputOptions)
+            .withAudioEnabled()
+            .start(ContextCompat.getMainExecutor(context), onEvent)
+    }
+
+    fun stopVideoRecording() {
+        activeRecording?.stop()
+        activeRecording = null
     }
 }

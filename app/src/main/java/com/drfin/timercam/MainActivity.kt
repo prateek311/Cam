@@ -41,27 +41,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun hasPermission(context: android.content.Context, permission: String): Boolean =
+    ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
 @Composable
 private fun AppRoot() {
     val context = LocalContext.current
-    var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.CAMERA,
-            ) == PackageManager.PERMISSION_GRANTED,
-        )
-    }
+    var hasCameraPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.CAMERA)) }
+    var hasAudioPermission by remember { mutableStateOf(hasPermission(context, Manifest.permission.RECORD_AUDIO)) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted -> hasCameraPermission = granted }
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted ->
+        hasCameraPermission = granted[Manifest.permission.CAMERA] ?: hasCameraPermission
+        hasAudioPermission = granted[Manifest.permission.RECORD_AUDIO] ?: hasAudioPermission
+    }
 
-    if (hasCameraPermission) {
+    // Mic is only required for video-with-sound; we still gate on it upfront (like
+    // camera) so recording never silently starts without audio the first time.
+    if (hasCameraPermission && hasAudioPermission) {
         CameraScreen()
     } else {
         PermissionRequiredScreen(onRequestPermission = {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         })
     }
 }
@@ -76,11 +78,11 @@ private fun PermissionRequiredScreen(onRequestPermission: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "Camera permission is required to take photos.",
+            text = "Camera and microphone permissions are required to take photos and record video.",
             style = MaterialTheme.typography.bodyLarge,
         )
         Button(onClick = onRequestPermission, modifier = Modifier.padding(top = 16.dp)) {
-            Text("Grant camera permission")
+            Text("Grant permissions")
         }
     }
 }
