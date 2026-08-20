@@ -15,6 +15,19 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        // Debug builds run on ephemeral CI runners, which otherwise auto-generate a new
+        // (throwaway) debug key on every run. Pinning a checked-in debug key here means
+        // every CI-built APK shares one signature, so installing a newer build updates
+        // in place instead of Android rejecting it as a signature mismatch.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
